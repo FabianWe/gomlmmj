@@ -33,30 +33,30 @@ func NewListManager() *ListManager {
 	return &ListManager{}
 }
 
-func (lm *ListManager) AddList(name string) bool {
+func (lm *ListManager) AddList(fullPath string) bool {
 	lm.mutex.Lock()
 	defer lm.mutex.Unlock()
-	if _, hasList := lm.lists[name]; hasList {
+	if _, hasList := lm.lists[fullPath]; hasList {
 		return false
 	}
-	lm.lists[name] = new(sync.RWMutex)
+	lm.lists[fullPath] = new(sync.RWMutex)
 	return true
 }
 
-func (lm *ListManager) RemoveList(name string) bool {
+func (lm *ListManager) RemoveList(fullPath string) bool {
 	lm.mutex.Lock()
 	defer lm.mutex.Unlock()
-	if _, hasList := lm.lists[name]; !hasList {
+	if _, hasList := lm.lists[fullPath]; !hasList {
 		return false
 	}
-	delete(lm.lists, name)
+	delete(lm.lists, fullPath)
 	return true
 }
 
-func (lm *ListManager) ReadList(name string) (bool, func()) {
+func (lm *ListManager) ReadList(fullPath string) (bool, func()) {
 	lm.mutex.RLock()
 	defer lm.mutex.RUnlock()
-	m, hasList := lm.lists[name]
+	m, hasList := lm.lists[fullPath]
 	if !hasList {
 		f := func() {}
 		return false, f
@@ -69,10 +69,10 @@ func (lm *ListManager) ReadList(name string) (bool, func()) {
 	return true, f
 }
 
-func (lm *ListManager) WriteList(name string) (bool, func()) {
+func (lm *ListManager) WriteList(fullPath string) (bool, func()) {
 	lm.mutex.RLock()
 	defer lm.mutex.RUnlock()
-	m, hasList := lm.lists[name]
+	m, hasList := lm.lists[fullPath]
 	if !hasList {
 		f := func() {}
 		return false, f
@@ -85,15 +85,25 @@ func (lm *ListManager) WriteList(name string) (bool, func()) {
 	return true, f
 }
 
-func (lm *ListManager) Init(spool string) error {
+func (lm *ListManager) Init(spoolList []string) error {
 	// remove old mutexes in any case
 	lm.lists = make(map[string]*sync.RWMutex)
-	lists, err := GetLists(spool)
-	if err != nil {
-		return err
+	ch := make(chan error, len(spoolList))
+	for _, spool := range spoolList {
+		go func(spool string) {
+			lists, err := GetLists(spool)
+			for _, list := range lists {
+				lm.AddList(listDir(spool, list))
+			}
+			ch <- err
+		}(spool)
 	}
-	for _, list := range lists {
-		lm.AddList(list)
+	var err error
+	for i := 0; i < len(spoolList); i++ {
+		next := <-ch
+		if err == nil {
+			err = next
+		}
 	}
-	return nil
+	return err
 }

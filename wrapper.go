@@ -32,6 +32,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,6 +68,15 @@ func parseListOutput(r io.Reader) ([]string, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+func parseCountOutput(r io.Reader) (int, error) {
+	content, readErr := ioutil.ReadAll(r)
+	if readErr != nil {
+		return -1, readErr
+	}
+	str := strings.TrimSpace(string(content))
+	return strconv.Atoi(str)
 }
 
 func listDir(spool, name string) string {
@@ -217,11 +227,47 @@ func (r UnsubRequest) GetArgs() ([]string, error) {
 	return args, nil
 }
 
+func GetMakeMLArgs(spool, name, domain, owner, lang string) ([]string, error) {
+	return []string{
+		"-L", name, "-d", domain, "-o", owner, "-l", lang, "-s", spool,
+	}, nil
+}
+
+func GetListArgs(spool, name string, mode UserType, count bool) ([]string, error) {
+	subType := ""
+	switch mode {
+	case -1:
+	case Digest:
+		subType = "-d"
+	case Moderator:
+		subType = "-m"
+	case Nomail:
+		subType = "-n"
+	case Owner:
+		subType = "-o"
+	case Subscriber:
+		subType = "-s"
+	default:
+		return nil, errors.New("Unkown subscription type")
+	}
+	args := []string{
+		"-L", listDir(spool, name),
+	}
+	if subType != "" {
+		args = append(args, subType)
+	}
+	if count {
+		args = append(args, "-c")
+	}
+	return args, nil
+}
+
 type MLMMJHandler interface {
-	MakeML(spool, name, domain, owner, lang string) (string, error)
-	Sub(request SubRequest) (string, error)
-	Unsub(request UnsubRequest) (string, error)
-	List(spool, name string, mode UserType) ([]string, error)
+	MakeML(ctx context.Context, spool, name, domain, owner, lang string) (string, error)
+	Sub(ctx context.Context, request SubRequest) (string, error)
+	Unsub(ctx context.Context, request UnsubRequest) (string, error)
+	List(ctx context.Context, spool, name string, mode UserType) ([]string, error)
+	Count(ctx context.Context, spool, name string, mode UserType) (int, error)
 }
 
 var (
@@ -233,61 +279,61 @@ type MLMMJWrapper struct {
 	handler MLMMJHandler
 }
 
-func NewMLMMJWrapper(spool string, handler MLMMJHandler) (*MLMMJWrapper, error) {
+func NewMLMMJWrapper(spools []string, handler MLMMJHandler) (*MLMMJWrapper, error) {
 	lm := NewListManager()
-	if err := lm.Init(spool); err != nil {
+	if err := lm.Init(spools); err != nil {
 		return nil, err
 	}
 	return &MLMMJWrapper{lm: lm, handler: handler}, nil
 }
 
 // TODO chown?
-func (wrapper *MLMMJWrapper) MakeML(spool, name, domain, owner, lang string) (string, error) {
+func (wrapper *MLMMJWrapper) MakeML(ctx context.Context, spool, name, domain, owner, lang string) (string, error) {
 	// first try to create the list
-	output, err := wrapper.handler.MakeML(spool, name, domain, owner, lang)
+	output, err := wrapper.handler.MakeML(ctx, spool, name, domain, owner, lang)
 	if err != nil {
 		return output, err
 	}
 	// creation successful, add to the manager
-	wrapper.lm.AddList(name)
+	wrapper.lm.AddList(listDir(spool, name))
 	return output, err
 }
 
-func (wrapper *MLMMJWrapper) Sub(request SubRequest) (string, error) {
+func (wrapper *MLMMJWrapper) Sub(ctx context.Context, r SubRequest) (string, error) {
 	// log this list for writing
-	hasList, lock := wrapper.lm.WriteList(request.Name)
+	hasList, lock := wrapper.lm.WriteList(listDir(r.Spool, r.Name))
 	defer lock()
 	if !hasList {
 		return "", UnwatchedList
 	}
 	// subscribe
-	return wrapper.handler.Sub(request)
+	return wrapper.handler.Sub(ctx, r)
 }
 
-func (wrapper *MLMMJWrapper) Unsub(request UnsubRequest) (string, error) {
+func (wrapper *MLMMJWrapper) Unsub(ctx context.Context, r UnsubRequest) (string, error) {
 	// log list for writing
-	hasList, lock := wrapper.lm.WriteList(request.Name)
+	hasList, lock := wrapper.lm.WriteList(listDir(r.Spool, r.Name))
 	defer lock()
 	if !hasList {
 		return "", UnwatchedList
 	}
 	// unsub
-	return wrapper.handler.Unsub(request)
+	return wrapper.handler.Unsub(ctx, r)
 }
 
-func (wrapper *MLMMJWrapper) List(spool, name string, mode UserType) ([]string, error) {
+func (wrapper *MLMMJWrapper) List(ctx context.Context, spool, name string, mode UserType) ([]string, error) {
 	// lock list for reading
-	hasList, lock := wrapper.lm.ReadList(name)
+	hasList, lock := wrapper.lm.ReadList(listDir(spool, name))
 	defer lock()
 	if !hasList {
 		return nil, UnwatchedList
 	}
-	return wrapper.handler.List(spool, name, mode)
+	return wrapper.handler.List(ctx, spool, name, mode)
 }
 
-func (wrapper *MLMMJWrapper) ListAllMembers(spool, name string) (subscribers, digest, nomail []string, err error) {
+func (wrapper *MLMMJWrapper) ListAllMembers(ctx context.Context, spool, name string) (subscribers, digest, nomail []string, err error) {
 	// lock list for reading
-	hasList, lock := wrapper.lm.ReadList(name)
+	hasList, lock := wrapper.lm.ReadList(listDir(spool, name))
 	defer lock()
 	if !hasList {
 		err = UnwatchedList
@@ -298,17 +344,17 @@ func (wrapper *MLMMJWrapper) ListAllMembers(spool, name string) (subscribers, di
 	// we write all errors to the result channel
 	ch := make(chan error, 3)
 	go func() {
-		sub, nextErr := wrapper.handler.List(spool, name, Subscriber)
+		sub, nextErr := wrapper.handler.List(ctx, spool, name, Subscriber)
 		subscribers = sub
 		ch <- nextErr
 	}()
 	go func() {
-		dg, nextErr := wrapper.handler.List(spool, name, Digest)
+		dg, nextErr := wrapper.handler.List(ctx, spool, name, Digest)
 		digest = dg
 		ch <- nextErr
 	}()
 	go func() {
-		nm, nextErr := wrapper.handler.List(spool, name, Nomail)
+		nm, nextErr := wrapper.handler.List(ctx, spool, name, Nomail)
 		nomail = nm
 		ch <- nextErr
 	}()
@@ -321,20 +367,42 @@ func (wrapper *MLMMJWrapper) ListAllMembers(spool, name string) (subscribers, di
 	return
 }
 
-func (wrapper *MLMMJWrapper) ListAllControllers(spool, name string) (owners, moderators []string, err error) {
+func (wrapper *MLMMJWrapper) ListAllControllers(ctx context.Context, spool, name string) (owners, moderators []string, err error) {
 	// lock list for reading
-	hasList, lock := wrapper.lm.ReadList(name)
+	hasList, lock := wrapper.lm.ReadList(listDir(spool, name))
 	defer lock()
 	if !hasList {
 		err = UnwatchedList
 		return
 	}
-	owners, err = wrapper.handler.List(spool, name, Owner)
-	if err != nil {
-		return
+	// again read concurrently
+	ch := make(chan error, 2)
+	go func() {
+		o, nextErr := wrapper.handler.List(ctx, spool, name, Owner)
+		owners = o
+		ch <- nextErr
+	}()
+	go func() {
+		m, nextErr := wrapper.handler.List(ctx, spool, name, Moderator)
+		moderators = m
+		ch <- nextErr
+	}()
+	for i := 0; i < 2; i++ {
+		nextErr := <-ch
+		if err == nil {
+			err = nextErr
+		}
 	}
-	moderators, err = wrapper.handler.List(spool, name, Moderator)
 	return
+}
+
+func (wrapper *MLMMJWrapper) Count(ctx context.Context, spool, name string, mode UserType) (int, error) {
+	hasList, lock := wrapper.lm.ReadList(listDir(spool, name))
+	defer lock()
+	if !hasList {
+		return -1, UnwatchedList
+	}
+	return wrapper.handler.Count(ctx, spool, name, mode)
 }
 
 type DockerHandler struct {
@@ -350,7 +418,7 @@ func NewDockerHandler(url string) *DockerHandler {
 	}
 }
 
-func (handler *DockerHandler) post(ctx context.Context, cmd string, args []interface{}) (string, error) {
+func (handler *DockerHandler) post(ctx context.Context, cmd string, args []string) (string, error) {
 	postArgs := map[string]interface{}{
 		"mlmmj-command": cmd,
 		"args":          args,
@@ -363,133 +431,71 @@ func (handler *DockerHandler) post(ctx context.Context, cmd string, args []inter
 	if reqErr != nil {
 		return "", reqErr
 	}
-	type resType struct {
-		resp *http.Response
-		err  error
-	}
-	resChan := make(chan resType)
 	req = req.WithContext(ctx)
-	go func() {
-		resp, doErr := handler.Client.Do(req)
-		resChan <- resType{resp, doErr}
-	}()
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case res := <-resChan:
-		if res.resp != nil {
-			defer res.resp.Body.Close()
-		}
-		if res.err != nil {
-			return "", res.err
-		}
-		var respContent struct {
-			ReturnCode int
-			Output     string
-		}
-		if err := json.NewDecoder(res.resp.Body).Decode(&respContent); err != nil {
-			return "", err
-		}
-		if respContent.ReturnCode != 0 {
-			return respContent.Output, errors.New(respContent.Output)
-		}
-		return respContent.Output, nil
+	resp, doErr := handler.Client.Do(req)
+	if resp != nil {
+		defer resp.Body.Close()
 	}
+	if doErr != nil {
+		return "", doErr
+	}
+	var respContent struct {
+		ReturnCode int
+		Output     string
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respContent); err != nil {
+		return "", err
+	}
+	if respContent.ReturnCode != 0 {
+		return respContent.Output, errors.New(respContent.Output)
+	}
+	return respContent.Output, nil
 }
 
-func (handler *DockerHandler) createContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), handler.Timeout)
-}
-
-func (handler *DockerHandler) MakeML(spool, name, domain, owner, lang string) (string, error) {
-	args := []interface{}{
-		"-L", name, "-d", domain, "-o", owner, "-l", lang, "-s", spool,
+func (handler *DockerHandler) MakeML(ctx context.Context, spool, name, domain, owner, lang string) (string, error) {
+	args, argsErr := GetMakeMLArgs(spool, name, domain, owner, lang)
+	if argsErr != nil {
+		return "", argsErr
 	}
-	ctx, cancel := handler.createContext()
-	defer cancel()
 	return handler.post(ctx, "mlmmj-make-ml", args)
 }
 
-func (handler *DockerHandler) Sub(r SubRequest) (string, error) {
-	subType := ""
-	switch r.Mode {
-	case Moderator, Owner:
-		return "", fmt.Errorf("Invalid subscription type %v for subscription", r.Mode)
-	case Subscriber:
-	case Digest:
-		subType = "-d"
-	case Nomail:
-		subType = "-n"
-	default:
-		return "", errors.New("Unkown subscription type")
+func (handler *DockerHandler) Sub(ctx context.Context, r SubRequest) (string, error) {
+	args, argsErr := r.GetArgs()
+	if argsErr != nil {
+		return "", argsErr
 	}
-	args := []interface{}{
-		"-L", listDir(r.Spool, r.Name), "-a", r.Mail,
-	}
-	if subType != "" {
-		args = append(args, subType)
-	}
-	if r.WelcomeMail {
-		args = append(args, "-c")
-	}
-	if r.ConfirmationMail {
-		args = append(args, "-C")
-	}
-	if r.ForceSubscription {
-		args = append(args, "-f")
-	}
-	if r.ModerationString != "" {
-		args = append(args, "-m", r.ModerationString)
-	}
-	if r.BeQuiet {
-		args = append(args, "-q")
-	}
-	if !r.MailAlreadySubscribed {
-		args = append(args, "-s")
-	}
-	ctx, cancel := handler.createContext()
-	defer cancel()
 	return handler.post(ctx, "mlmmj-sub", args)
 }
 
-func (handler *DockerHandler) Unsub(r UnsubRequest) (string, error) {
-	subType := ""
-	switch r.Mode {
-	case Moderator, Owner:
-		return "", fmt.Errorf("Invalid subscription type %v for unsubscription", r.Mode)
-	case Subscriber:
-		subType = "-N"
-	case Digest:
-		subType = "-d"
-	case Nomail:
-		subType = "-n"
-	case -1:
-	default:
-		return "", errors.New("Unkown subscription type")
+func (handler *DockerHandler) Unsub(ctx context.Context, r UnsubRequest) (string, error) {
+	args, argsErr := r.GetArgs()
+	if argsErr != nil {
+		return "", argsErr
 	}
-	args := []interface{}{
-		"-L", listDir(r.Spool, r.Name),
-	}
-	if subType != "" {
-		args = append(args, subType)
-	}
-	if r.GoodBye {
-		args = append(args, "-c")
-	}
-	if r.ConfirmationMail {
-		args = append(args, "-C")
-	}
-	if r.BeQuiet {
-		args = append(args, "-q")
-	}
-	if !r.MailNotSubscribed {
-		args = append(args, "-s")
-	}
-	ctx, cancel := handler.createContext()
-	defer cancel()
 	return handler.post(ctx, "mlmmj-unsub", args)
 }
 
-func (handler *DockerHandler) List(spool, name string, mode UserType) ([]string, error) {
-	return nil, nil
+func (handler *DockerHandler) List(ctx context.Context, spool, name string, mode UserType) ([]string, error) {
+	args, argsErr := GetListArgs(spool, name, mode, false)
+	if argsErr != nil {
+		return nil, argsErr
+	}
+	out, err := handler.post(ctx, "mlmmj-list", args)
+	if err != nil {
+		return nil, err
+	}
+	return parseListOutput(strings.NewReader(out))
+}
+
+func (handler *DockerHandler) Count(ctx context.Context, spool, name string, mode UserType) (int, error) {
+	args, argsErr := GetListArgs(spool, name, mode, true)
+	if argsErr != nil {
+		return -1, argsErr
+	}
+	out, err := handler.post(ctx, "mlmmj-list", args)
+	if err != nil {
+		return -1, err
+	}
+	return parseCountOutput(strings.NewReader(out))
 }
